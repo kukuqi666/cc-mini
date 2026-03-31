@@ -12,6 +12,7 @@ from pathlib import Path
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.styles import Style as PTStyle
 from rich.console import Console
 from rich.live import Live
 from rich.spinner import Spinner
@@ -302,20 +303,99 @@ def main() -> None:
     # Track last Ctrl+C time for double-press exit (matches useDoublePress)
     last_ctrlc_time = 0.0
 
+    # Companion animator — drives real-time idle animation in bottom_toolbar
+    # Matches CompanionSprite.tsx tick-based animation system
+    animator = None
+    try:
+        from .buddy.companion import get_companion
+        from .buddy.storage import load_companion_muted
+        from .buddy.animator import CompanionAnimator
+        if not load_companion_muted():
+            comp = get_companion()
+            if comp:
+                animator = CompanionAnimator(comp)
+    except Exception:
+        pass
+
+    def _bottom_toolbar():
+        """Return animated companion sprite for bottom_toolbar."""
+        if animator is None:
+            return None
+        return animator.toolbar_text()
+
+    def _set_reaction(text: str, print_to_terminal: bool = False) -> None:
+        """Observer callback — delivers reaction to animator's toolbar bubble.
+
+        For normal mode (reacting to Claude): only shows in toolbar bubble.
+        For direct address mode: also prints to terminal scroll history.
+        """
+        if animator:
+            animator.set_reaction(text)
+        if print_to_terminal:
+            try:
+                from .buddy.companion import get_companion
+                from .buddy.types import RARITY_COLORS
+                from .buddy.sprites import render_face
+                from .buddy.types import CompanionBones
+                comp = get_companion()
+                if comp:
+                    color = RARITY_COLORS.get(comp.rarity, 'dim')
+                    bones = CompanionBones(
+                        rarity=comp.rarity, species=comp.species,
+                        eye=comp.eye, hat=comp.hat, shiny=comp.shiny, stats=comp.stats,
+                    )
+                    face = render_face(bones)
+                    console.print(f'\n[{color}]{face} {comp.name}:[/{color}] [{color} italic]{text}[/{color} italic]')
+            except Exception:
+                pass
+
     while True:
+        # Start/restart animator before each prompt (picks up newly hatched companions)
+        if animator is None:
+            try:
+                from .buddy.companion import get_companion
+                from .buddy.storage import load_companion_muted
+                from .buddy.animator import CompanionAnimator
+                if not load_companion_muted():
+                    comp = get_companion()
+                    if comp:
+                        animator = CompanionAnimator(comp)
+            except Exception:
+                pass
+
         try:
-            user_input = session.prompt("\n> ").strip()
+            if animator:
+                animator.start()
+            # Override default bottom-toolbar reverse-video background
+            # so sprite and bubble render with normal terminal colors
+            _toolbar_style = PTStyle.from_dict({
+                'bottom-toolbar': 'noreverse',
+                'bottom-toolbar.text': '',
+            })
+            user_input = session.prompt(
+                "\n> ",
+                bottom_toolbar=_bottom_toolbar if animator else None,
+                refresh_interval=0.5 if animator else None,
+                style=_toolbar_style if animator else None,
+            ).strip()
         except KeyboardInterrupt:
             now = time.monotonic()
             if now - last_ctrlc_time <= _DOUBLE_PRESS_TIMEOUT_MS:
+                if animator:
+                    animator.stop()
                 console.print("\n[dim]Goodbye.[/dim]")
                 break
             last_ctrlc_time = now
             console.print("\n[dim yellow]Press Ctrl+C again to exit[/dim yellow]")
             continue
         except EOFError:
+            if animator:
+                animator.stop()
             console.print("\n[dim]Goodbye.[/dim]")
             break
+        finally:
+            if animator:
+                animator.stop()
 
         # Reset double-press timer on any normal input
         last_ctrlc_time = 0.0
@@ -326,14 +406,27 @@ def main() -> None:
             console.print("[dim]Goodbye.[/dim]")
             break
 
-        # Slash commands
+        # Slash commands (session, compact, help, etc.)
         cmd = parse_command(user_input)
         if cmd is not None:
             cmd_name, cmd_args = cmd
-            # /exit and /quit already handled above
             if cmd_name in ("exit", "quit"):
                 console.print("[dim]Goodbye.[/dim]")
                 break
+            # /buddy is handled separately (companion pet)
+            if cmd_name == "buddy":
+                from .buddy.commands import handle_buddy_command
+                handle_buddy_command(cmd_args, engine._client, console)
+                # Refresh animator in case companion was just hatched
+                try:
+                    from .buddy.companion import get_companion
+                    from .buddy.animator import CompanionAnimator
+                    comp = get_companion()
+                    if comp:
+                        animator = CompanionAnimator(comp)
+                except Exception:
+                    pass
+                continue
             cmd_ctx = CommandContext(
                 engine=engine,
                 session_store=session_store,
@@ -343,7 +436,6 @@ def main() -> None:
                 new_session_store=lambda: SessionStore(cwd=cwd, model=app_config.model),
             )
             handle_command(cmd_name, cmd_args, cmd_ctx)
-            # Commands may swap the session store (e.g. /resume, /clear)
             session_store = cmd_ctx.session_store
             continue
 
@@ -358,7 +450,67 @@ def main() -> None:
             except Exception as e:
                 console.print(f"[dim red]Auto-compact failed: {e}[/dim red]")
 
+        # Check if user is talking directly to companion — skip Claude, let
+        # companion reply directly via observer (no awkward "." response)
+        _companion_addressed = False
+        try:
+            from .buddy.companion import get_companion
+            from .buddy.storage import load_companion_muted
+            from .buddy.observer import fire_companion_observer, _is_addressed
+            if not load_companion_muted():
+                comp = get_companion()
+                if comp and _is_addressed(user_input, comp.name):
+                    _companion_addressed = True
+                    import threading
+                    reply_event = threading.Event()
+                    def _direct_reply(text: str) -> None:
+                        _set_reaction(text, print_to_terminal=True)
+                        reply_event.set()
+                    fire_companion_observer(
+                        '', comp, engine._client, _direct_reply,
+                        user_msg=user_input,
+                    )
+                    reply_event.wait(timeout=10)
+        except Exception:
+            pass
+
+        if _companion_addressed:
+            continue
+
         run_query(engine, _parse_input(user_input), print_mode=False, permissions=permissions)
+
+        # Fire companion observer in background after each turn
+        try:
+            from .buddy.companion import get_companion
+            from .buddy.storage import load_companion_muted
+            from .buddy.observer import fire_companion_observer
+            if not load_companion_muted():
+                comp = get_companion()
+                if comp and engine._messages:
+                    last_msg = engine._messages[-1]
+                    if last_msg.get("role") == "assistant":
+                        content = last_msg.get("content", "")
+                        # Extract text from content — handles both SDK objects
+                        # and normalized dicts (from _normalize_message_content)
+                        if isinstance(content, str):
+                            assistant_text = content
+                        elif isinstance(content, list):
+                            parts = []
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    parts.append(block.get("text", ""))
+                                elif hasattr(block, "text"):
+                                    parts.append(block.text)
+                            assistant_text = ' '.join(parts)
+                        else:
+                            assistant_text = str(content)
+                        if assistant_text.strip():
+                            fire_companion_observer(
+                                assistant_text, comp, engine._client, _set_reaction,
+                                user_msg=user_input,
+                            )
+        except Exception:
+            pass  # Non-essential
 
 
 if __name__ == "__main__":

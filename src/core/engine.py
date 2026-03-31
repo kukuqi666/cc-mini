@@ -111,6 +111,7 @@ class Engine:
         self._permissions = permission_checker
         self._messages: list[dict] = []
         self._aborted = False
+        self._turn_start_len: int | None = None
         self._active_stream = None  # reference to current HTTP stream
         self._session_store = session_store
 
@@ -156,28 +157,16 @@ class Engine:
                 pass
 
     def cancel_turn(self):
-        """Roll back messages to the state before the current turn started."""
-        while self._messages:
-            last = self._messages[-1]
-            if last["role"] == "assistant":
-                break
-            self._messages.pop()
-        if self._messages and self._messages[-1]["role"] == "assistant":
-            content = self._messages[-1].get("content", [])
-            has_tool_use = any(
-                getattr(b, "type", None) == "tool_use"
-                or (isinstance(b, dict) and b.get("type") == "tool_use")
-                for b in (content if isinstance(content, list) else [])
-            )
-            if has_tool_use:
-                self._messages.pop()
-                if self._messages and self._messages[-1]["role"] == "user":
-                    last_content = self._messages[-1].get("content", "")
-                    if isinstance(last_content, list) and all(
-                        isinstance(c, dict) and c.get("type") == "tool_result"
-                        for c in last_content
-                    ):
-                        self._messages.pop()
+        """Roll back messages to the state before the current turn started.
+
+        Uses _turn_start_len (set at the beginning of submit()) to restore
+        messages to the exact state before the turn. This is more robust than
+        trying to walk back individual messages, especially when a turn has
+        multiple tool_use/tool_result cycles.
+        """
+        if self._turn_start_len is not None:
+            del self._messages[self._turn_start_len:]
+            self._turn_start_len = None
 
     def submit(self, user_input: str | list) -> Iterator[tuple]:
         """Send user message; yield events until the conversation turn completes.
@@ -193,6 +182,7 @@ class Engine:
           AbortedError — if abort() was called (by Esc listener or Ctrl+C)
         """
         self._aborted = False
+        self._turn_start_len = len(self._messages)
         self._messages.append({
             "role": "user",
             "content": _normalize_message_content(user_input),

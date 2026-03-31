@@ -28,6 +28,11 @@ def build_system_prompt(cwd: str | None = None) -> str:
     if claude_md:
         parts.append(f"\n# CLAUDE.md\n{claude_md}")
 
+    # Companion intro (if hatched and not muted)
+    companion_text = _get_companion_intro()
+    if companion_text:
+        parts.append(f"\n{companion_text}")
+
     return "\n".join(parts)
 
 
@@ -59,6 +64,22 @@ def _get_git_status(cwd: str) -> str:
         if log:
             parts.append(f"Recent commits:\n{log}")
         return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _get_companion_intro() -> str:
+    try:
+        from .buddy.companion import get_companion
+        from .buddy.storage import load_companion_muted
+        from .buddy.prompt import companion_intro_text
+
+        if load_companion_muted():
+            return ""
+        companion = get_companion()
+        if companion is None:
+            return ""
+        return companion_intro_text(companion.name, companion.species)
     except Exception:
         return ""
 
