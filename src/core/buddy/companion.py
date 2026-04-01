@@ -17,6 +17,8 @@ from functools import lru_cache
 from typing import Callable, Sequence
 
 from .types import (
+    ALL_SPECIES,
+    BONUS_SPECIES,
     EYES,
     HATS,
     RARITIES,
@@ -114,11 +116,11 @@ class Roll:
     inspiration_seed: int
 
 
-def _roll_from(rng: Callable[[], float]) -> Roll:
+def _roll_from(rng: Callable[[], float], species_pool: Sequence = SPECIES) -> Roll:
     rarity = roll_rarity(rng)
     bones = CompanionBones(
         rarity=rarity,
-        species=pick(rng, SPECIES),
+        species=pick(rng, species_pool),
         eye=pick(rng, EYES),
         hat='none' if rarity == 'common' else pick(rng, HATS),
         shiny=rng() < 0.01,
@@ -130,7 +132,8 @@ def _roll_from(rng: Callable[[], float]) -> Roll:
 @lru_cache(maxsize=1)
 def roll(user_id: str) -> Roll:
     key = user_id + SALT
-    return _roll_from(mulberry32(hash_string(key)))
+    pool = ALL_SPECIES if any(b in user_id.lower() for b in BONUS_SPECIES) else SPECIES
+    return _roll_from(mulberry32(hash_string(key)), species_pool=pool)
 
 
 def roll_with_seed(seed: str) -> Roll:
