@@ -142,12 +142,21 @@ def _bordered_prompt(
     completer: Completer | None = None,
     animator_toolbar=None,
     refresh_interval: float | None = None,
+    terminal_mode_ref: list | None = None,
 ) -> str:
     """Prompt with bordered input box that adapts to content height.
+
+    terminal_mode_ref is a mutable [bool] list so '!' can toggle it in-place.
 
     Raises KeyboardInterrupt on Ctrl+C, EOFError on Ctrl+D with empty buffer.
     """
     import os
+
+    if terminal_mode_ref is None:
+        terminal_mode_ref = [False]
+
+    def _is_terminal():
+        return terminal_mode_ref[0]
 
     def _accept(b):
         get_app().exit(result=b.text)
@@ -156,9 +165,29 @@ def _bordered_prompt(
     buf = Buffer(
         history=history,
         completer=completer,
-        complete_while_typing=True,
+        complete_while_typing=False,
         accept_handler=_accept,
     )
+
+    def _trigger_completion_next_tick():
+        """Schedule start_completion on the next event-loop tick.
+
+        This avoids the race with prompt_toolkit's internal completion reset
+        that happens synchronously during text insertion.
+        """
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            loop.call_soon(lambda: buf.start_completion(select_first=False))
+        except RuntimeError:
+            pass
+
+    def _on_text_changed(_buf):
+        """Trigger completion popup when input starts with '/'."""
+        if _buf.text.lstrip().startswith('/'):
+            _trigger_completion_next_tick()
+
+    buf.on_text_changed += _on_text_changed
 
     def _top():
         try:
@@ -166,6 +195,8 @@ def _bordered_prompt(
         except OSError:
             w = 80
         fill = "\u2500" * max(0, w - 1)
+        if _is_terminal():
+            return [('bold fg:ansiyellow', f'\u256d{fill}')]
         return [('bold fg:ansicyan', f'\u256d{fill}')]
 
     def _bot():
@@ -173,9 +204,15 @@ def _bordered_prompt(
             w = os.get_terminal_size().columns
         except OSError:
             w = 80
-        hints = "\u2500 Enter send \u00b7 Alt+Enter newline \u00b7 /help "
-        fill = "\u2500" * max(0, w - 1 - len(hints))
-        parts: list[tuple[str, str]] = [('fg:ansicyan', f'\u2570{hints}{fill}')]
+        if _is_terminal():
+            hints = "\u2500 TERMINAL MODE \u00b7 ! to exit \u00b7 Enter run "
+            fill = "\u2500" * max(0, w - 1 - len(hints))
+            parts: list[tuple[str, str]] = [('fg:ansiyellow', f'\u2570{hints}{fill}')]
+        else:
+            hints = "\u2500 Enter send \u00b7 Alt+Enter newline \u00b7 ! shell \u00b7 / commands "
+            fill = "\u2500" * max(0, w - 1 - len(hints))
+            parts: list[tuple[str, str]] = [('fg:ansicyan', f'\u2570{hints}{fill}')]
+
         if animator_toolbar:
             extra = animator_toolbar()
             if extra:
@@ -184,8 +221,10 @@ def _bordered_prompt(
         return parts
 
     def _line_prefix(lineno, wrap_count):
-        """First visual line gets '> ', all others get '  ' padding."""
+        """First visual line gets '> ' or '$ ', all others get '  ' padding."""
         if lineno == 0 and wrap_count == 0:
+            if _is_terminal():
+                return [('bold fg:ansiyellow', '$ ')]
             return [('bold fg:ansicyan', '> ')]
         return [('', '  ')]
 
@@ -213,9 +252,24 @@ def _bordered_prompt(
 
     kb = KeyBindings()
 
+    @kb.add('!')
+    def _(event):
+        if not buf.text:
+            # Toggle terminal mode in-place, no submit
+            terminal_mode_ref[0] = not terminal_mode_ref[0]
+            event.app.invalidate()  # force UI refresh for color change
+        else:
+            buf.insert_text('!')
+
     @kb.add('enter')
     def _(event):
-        buf.validate_and_handle()
+        # Feature: backslash + Enter = newline continuation
+        # Check at key-binding level to avoid buffer.reset() clearing text
+        if buf.text.endswith('\\'):
+            buf.delete_before_cursor(1)
+            buf.insert_text('\n')
+        else:
+            buf.validate_and_handle()
 
     @kb.add('escape', 'enter')
     def _(event):
@@ -542,6 +596,25 @@ def main() -> None:
     # Track last Ctrl+C time for double-press exit (matches useDoublePress)
     last_ctrlc_time = 0.0
 
+    # Terminal mode state — shared mutable ref toggled by "!" key binding
+    _terminal_mode_ref = [False]
+
+    def _run_shell(cmd: str) -> None:
+        """Execute a shell command and print output."""
+        import subprocess
+        console.print(f"[dim]$ {cmd}[/dim]")
+        try:
+            result = subprocess.run(
+                cmd, shell=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            if result.stdout:
+                console.print(result.stdout, end="", markup=False)
+            if result.returncode != 0:
+                console.print(f"[red][exit {result.returncode}][/red]")
+        except Exception as exc:
+            console.print(f"[red]Error: {exc}[/red]")
+
     # Companion animator — drives real-time idle animation in bottom_toolbar
     # Matches CompanionSprite.tsx tick-based animation system
     animator = None
@@ -600,12 +673,14 @@ def main() -> None:
             if animator:
                 animator.start()
             console.print()
+            _terminal_mode_ref[0] = False  # always start in chat mode
             user_input = _bordered_prompt(
                 console,
                 history=_file_history,
                 completer=_slash_completer,
                 animator_toolbar=animator.toolbar_text if animator else None,
                 refresh_interval=0.5 if animator else None,
+                terminal_mode_ref=_terminal_mode_ref,
             ).strip()
         except KeyboardInterrupt:
             now = time.monotonic()
@@ -630,6 +705,19 @@ def main() -> None:
         last_ctrlc_time = 0.0
 
         if not user_input:
+            continue
+
+        # ---------------------------------------------------------------------------
+        # Terminal mode — "!" key toggles mode in-place (no submit needed).
+        # In terminal mode every submitted input is a shell command.
+        # Outside terminal mode "!cmd" runs a one-off shell command.
+        # ---------------------------------------------------------------------------
+        if _terminal_mode_ref[0]:
+            _run_shell(user_input)
+            continue
+
+        if user_input.startswith("!") and len(user_input) > 1:
+            _run_shell(user_input[1:].lstrip())
             continue
         if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
             console.print("[dim]Goodbye.[/dim]")
