@@ -17,6 +17,8 @@ from functools import lru_cache
 from typing import Callable, Sequence
 
 from .types import (
+    ALL_SPECIES,
+    BONUS_SPECIES,
     EYES,
     HATS,
     RARITIES,
@@ -114,11 +116,11 @@ class Roll:
     inspiration_seed: int
 
 
-def _roll_from(rng: Callable[[], float]) -> Roll:
+def _roll_from(rng: Callable[[], float], species_pool: Sequence = SPECIES) -> Roll:
     rarity = roll_rarity(rng)
     bones = CompanionBones(
         rarity=rarity,
-        species=pick(rng, SPECIES),
+        species=pick(rng, species_pool),
         eye=pick(rng, EYES),
         hat='none' if rarity == 'common' else pick(rng, HATS),
         shiny=rng() < 0.01,
@@ -130,7 +132,8 @@ def _roll_from(rng: Callable[[], float]) -> Roll:
 @lru_cache(maxsize=1)
 def roll(user_id: str) -> Roll:
     key = user_id + SALT
-    return _roll_from(mulberry32(hash_string(key)))
+    pool = ALL_SPECIES if any(b in user_id.lower() for b in BONUS_SPECIES) else SPECIES
+    return _roll_from(mulberry32(hash_string(key)), species_pool=pool)
 
 
 def roll_with_seed(seed: str) -> Roll:
@@ -145,7 +148,14 @@ def companion_user_id() -> str:
     """Derive a stable user identity for companion generation.
 
     Since mini-claude has no OAuth, use username@hostname as the seed.
+    Same user on same machine always gets the same companion.
+
+    Set CC_MINI_BUDDY_SEED env var to override (useful for testing).
     """
+    import os
+    override = os.environ.get('CC_MINI_BUDDY_SEED')
+    if override:
+        return override
     try:
         return f"{getpass.getuser()}@{socket.gethostname()}"
     except Exception:
@@ -156,14 +166,14 @@ def companion_user_id() -> str:
 # Get companion (merge stored soul + regenerated bones)
 # ---------------------------------------------------------------------------
 
-def get_companion() -> Companion | None:
-    """Get the full companion if one has been hatched, or None."""
-    from .storage import load_stored_companion
-
-    stored = load_stored_companion()
-    if stored is None:
-        return None
-    bones = roll(companion_user_id()).bones
+def _companion_from_stored(
+    stored_name: str,
+    stored_personality: str,
+    stored_hatched_at: int,
+    seed: str,
+) -> Companion:
+    """Build a full Companion by regenerating bones from seed."""
+    bones = roll_with_seed(seed).bones
     return Companion(
         rarity=bones.rarity,
         species=bones.species,
@@ -171,7 +181,36 @@ def get_companion() -> Companion | None:
         hat=bones.hat,
         shiny=bones.shiny,
         stats=bones.stats,
-        name=stored.name,
-        personality=stored.personality,
-        hatched_at=stored.hatched_at,
+        name=stored_name,
+        personality=stored_personality,
+        hatched_at=stored_hatched_at,
     )
+
+
+def get_companion() -> Companion | None:
+    """Get the full active companion if one has been hatched, or None."""
+    from .storage import load_stored_companion, load_active_seed
+
+    stored = load_stored_companion()
+    if stored is None:
+        return None
+    seed = load_active_seed()
+    if not seed:
+        # Fallback for legacy data
+        seed = companion_user_id() + SALT
+    return _companion_from_stored(
+        stored.name, stored.personality, stored.hatched_at, seed,
+    )
+
+
+def get_all_companions() -> list[Companion]:
+    """Get all hatched companions (bones regenerated from each seed)."""
+    from .storage import load_all_stored_companions
+
+    result = []
+    for sc in load_all_stored_companions():
+        seed = sc.seed or (companion_user_id() + SALT)
+        result.append(_companion_from_stored(
+            sc.name, sc.personality, sc.hatched_at, seed,
+        ))
+    return result

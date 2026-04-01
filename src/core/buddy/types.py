@@ -55,6 +55,10 @@ SPECIES = (
     'rabbit', 'mushroom', 'chonk',
 )
 
+# Bonus species — only available via CC_MINI_BUDDY_SEED, not in random pool
+BONUS_SPECIES = ('pikachu',)
+ALL_SPECIES = SPECIES + BONUS_SPECIES
+
 # ---------------------------------------------------------------------------
 # Appearance
 # ---------------------------------------------------------------------------
@@ -99,6 +103,12 @@ class StoredCompanion:
     name: str
     personality: str
     hatched_at: int  # ms since epoch
+
+
+@dataclass(frozen=True)
+class StoredCompanionWithSeed(StoredCompanion):
+    """Stored companion that also remembers the seed used to generate bones."""
+    seed: str = ''
 
 
 @dataclass(frozen=True)

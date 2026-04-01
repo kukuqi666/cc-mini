@@ -168,7 +168,10 @@ class SessionStore:
                 line = line.strip()
                 if not line:
                     continue
-                obj = json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
                 obj.pop("_ts", None)
                 messages.append(obj)
         return messages
